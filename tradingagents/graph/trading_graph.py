@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import json
 from datetime import datetime, timedelta
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Callable, Dict, Any, Tuple, List, Optional
 
 import yfinance as yf
 
@@ -114,7 +114,6 @@ class TradingAgentsGraph:
             self.deep_thinking_llm,
             self.tool_nodes,
             self.conditional_logic,
-            analyst_concurrency_limit=self.config.get("analyst_concurrency_limit", 1),
         )
 
         self.propagator = Propagator(
@@ -212,6 +211,31 @@ class TradingAgentsGraph:
                 return benchmark
         return benchmark_map.get("", "SPY")
 
+    def _returns_window(
+        self, trade_date: str, holding_days: int,
+    ) -> Tuple[datetime, str]:
+        start = datetime.strptime(trade_date, "%Y-%m-%d")
+        end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
+        return start, end.strftime("%Y-%m-%d")
+
+    def _returns_from_history(
+        self, stock, bench, holding_days: int,
+    ) -> Tuple[Optional[float], Optional[float], Optional[int]]:
+        if len(stock) < 2 or len(bench) < 2:
+            return None, None, None
+
+        actual_days = min(holding_days, len(stock) - 1, len(bench) - 1)
+        raw = float(
+            (stock["Close"].iloc[actual_days] - stock["Close"].iloc[0])
+            / stock["Close"].iloc[0]
+        )
+        bench_ret = float(
+            (bench["Close"].iloc[actual_days] - bench["Close"].iloc[0])
+            / bench["Close"].iloc[0]
+        )
+        alpha = raw - bench_ret
+        return raw, alpha, actual_days
+
     def _fetch_returns(
         self, ticker: str, trade_date: str, holding_days: int = 5,
         benchmark: str = "SPY",
@@ -224,27 +248,11 @@ class TradingAgentsGraph:
         unavailable (too recent, delisted, or network error).
         """
         try:
-            start = datetime.strptime(trade_date, "%Y-%m-%d")
-            end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
-            end_str = end.strftime("%Y-%m-%d")
+            _, end_str = self._returns_window(trade_date, holding_days)
 
             stock = yf.Ticker(ticker).history(start=trade_date, end=end_str)
             bench = yf.Ticker(benchmark).history(start=trade_date, end=end_str)
-
-            if len(stock) < 2 or len(bench) < 2:
-                return None, None, None
-
-            actual_days = min(holding_days, len(stock) - 1, len(bench) - 1)
-            raw = float(
-                (stock["Close"].iloc[actual_days] - stock["Close"].iloc[0])
-                / stock["Close"].iloc[0]
-            )
-            bench_ret = float(
-                (bench["Close"].iloc[actual_days] - bench["Close"].iloc[0])
-                / bench["Close"].iloc[0]
-            )
-            alpha = raw - bench_ret
-            return raw, alpha, actual_days
+            return self._returns_from_history(stock, bench, holding_days)
         except Exception as e:
             logger.warning(
                 "Could not resolve outcome for %s on %s vs %s (will retry next run): %s",
@@ -267,11 +275,25 @@ class TradingAgentsGraph:
             return
 
         benchmark = self._resolve_benchmark(ticker)
+        benchmark_history = {}
         updates = []
         for entry in pending:
-            raw, alpha, days = self._fetch_returns(
-                ticker, entry["date"], benchmark=benchmark,
-            )
+            trade_date = entry["date"]
+            try:
+                _, end_str = self._returns_window(trade_date, 5)
+                stock = yf.Ticker(ticker).history(start=trade_date, end=end_str)
+                cache_key = (benchmark, trade_date, end_str)
+                bench = benchmark_history.get(cache_key)
+                if bench is None:
+                    bench = yf.Ticker(benchmark).history(start=trade_date, end=end_str)
+                    benchmark_history[cache_key] = bench
+                raw, alpha, days = self._returns_from_history(stock, bench, 5)
+            except Exception as e:
+                logger.warning(
+                    "Could not resolve outcome for %s on %s vs %s (will retry next run): %s",
+                    ticker, trade_date, benchmark, e,
+                )
+                raw, alpha, days = None, None, None
             if raw is None:
                 continue  # price not available yet — try again next run
             reflection = self.reflector.reflect_on_final_decision(
@@ -292,7 +314,13 @@ class TradingAgentsGraph:
         if updates:
             self.memory_log.batch_update_with_outcomes(updates)
 
-    def propagate(self, company_name, trade_date, asset_type: str = "stock"):
+    def propagate(
+        self,
+        company_name,
+        trade_date,
+        asset_type: str = "stock",
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ):
         """Run the trading agents graph for a company on a specific date.
 
         ``asset_type`` selects between the stock pipeline (default) and the
@@ -301,6 +329,13 @@ class TradingAgentsGraph:
         ``checkpoint_enabled`` is set in config, the graph is recompiled with
         a per-ticker SqliteSaver so a crashed run can resume from the last
         successful node on a subsequent invocation with the same ticker+date.
+
+        Args:
+            progress_callback: Optional callable invoked with the langgraph
+                node name each time a node completes. Enables external
+                streaming surfaces (e.g. SSE) to display per-agent progress.
+                Exceptions raised by the callback are swallowed so they cannot
+                interrupt the run.
         """
         self.ticker = company_name
 
@@ -326,14 +361,25 @@ class TradingAgentsGraph:
                 logger.info("Starting fresh for %s on %s", company_name, trade_date)
 
         try:
-            return self._run_graph(company_name, trade_date, asset_type=asset_type)
+            return self._run_graph(
+                company_name,
+                trade_date,
+                asset_type=asset_type,
+                progress_callback=progress_callback,
+            )
         finally:
             if self._checkpointer_ctx is not None:
                 self._checkpointer_ctx.__exit__(None, None, None)
                 self._checkpointer_ctx = None
                 self.graph = self.workflow.compile()
 
-    def _run_graph(self, company_name, trade_date, asset_type: str = "stock"):
+    def _run_graph(
+        self,
+        company_name,
+        trade_date,
+        asset_type: str = "stock",
+        progress_callback: Optional[Callable[[str], None]] = None,
+    ):
         """Execute the graph and write the resulting state to disk and memory log."""
         # Initialize state — inject memory log context for PM.
         past_context = self.memory_log.get_past_context(company_name)
@@ -347,7 +393,33 @@ class TradingAgentsGraph:
             tid = thread_id(company_name, str(trade_date))
             args.setdefault("config", {}).setdefault("configurable", {})["thread_id"] = tid
 
-        if self.debug:
+        def _notify(node_name: str) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(node_name)
+            except Exception as cb_exc:  # pragma: no cover - never break the run
+                logger.warning("progress_callback raised: %s", cb_exc)
+
+        if progress_callback is not None:
+            # Stream both "updates" (node-level progress) and "values"
+            # (cumulative state) so we can surface per-agent progress AND
+            # still recover the final state without manual reducer logic.
+            # Override the default "values" stream_mode that Propagator sets
+            # — passing both would raise TypeError (duplicate kwarg).
+            stream_args = {**args, "stream_mode": ["updates", "values"]}
+            final_state = None
+            for chunk in self.graph.stream(init_agent_state, **stream_args):
+                mode, data = chunk
+                if mode == "updates" and isinstance(data, dict):
+                    for node_name in data.keys():
+                        _notify(node_name)
+                elif mode == "values":
+                    final_state = data
+            if final_state is None:
+                # Defensive: stream produced no value chunk; fall back to invoke.
+                final_state = self.graph.invoke(init_agent_state, **args)
+        elif self.debug:
             trace = []
             for chunk in self.graph.stream(init_agent_state, **args):
                 if len(chunk["messages"]) == 0:

@@ -14,8 +14,14 @@ class AnalystNodeSpec:
 
 @dataclass(frozen=True)
 class AnalystExecutionPlan:
+    """Sequential analyst plan.
+
+    ``concurrency_limit`` is currently always 1 and reserved for future
+    reducer-safe fan-out work.
+    """
+
     specs: List[AnalystNodeSpec]
-    concurrency_limit: int
+    concurrency_limit: int = 1
 
 
 ANALYST_NODE_SPECS: Dict[str, AnalystNodeSpec] = {
@@ -54,13 +60,7 @@ ANALYST_NODE_SPECS: Dict[str, AnalystNodeSpec] = {
 }
 
 
-def build_analyst_execution_plan(
-    selected_analysts: Iterable[str],
-    concurrency_limit: int = 1,
-) -> AnalystExecutionPlan:
-    if concurrency_limit < 1:
-        raise ValueError("analyst concurrency limit must be >= 1")
-
+def build_analyst_execution_plan(selected_analysts: Iterable[str]) -> AnalystExecutionPlan:
     specs: List[AnalystNodeSpec] = []
     for analyst_key in selected_analysts:
         spec = ANALYST_NODE_SPECS.get(analyst_key)
@@ -71,7 +71,7 @@ def build_analyst_execution_plan(
     if not specs:
         raise ValueError("at least one analyst must be selected")
 
-    return AnalystExecutionPlan(specs=specs, concurrency_limit=concurrency_limit)
+    return AnalystExecutionPlan(specs=specs)
 
 
 def get_initial_analyst_node(plan: AnalystExecutionPlan) -> str:

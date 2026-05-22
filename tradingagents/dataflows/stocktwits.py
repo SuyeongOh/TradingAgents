@@ -27,6 +27,18 @@ _API = "https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json"
 _UA = "tradingagents/0.2 (+https://github.com/TauricResearch/TradingAgents)"
 
 
+def _is_unavailable_status(status: int) -> bool:
+    return status in {403, 429} or status >= 500
+
+
+def _unavailable_placeholder(status: int, message: str) -> str:
+    return (
+        f"<stocktwits unavailable: HTTP {status} {message}. "
+        f"Data source temporarily unavailable (HTTP {status}). "
+        "Treat sentiment signal as missing, not neutral.>"
+    )
+
+
 def fetch_stocktwits_messages(ticker: str, limit: int = 30, timeout: float = 10.0) -> str:
     """Fetch recent StockTwits messages for ``ticker`` and return them as a
     formatted plaintext block ready for prompt injection.
@@ -40,7 +52,15 @@ def fetch_stocktwits_messages(ticker: str, limit: int = 30, timeout: float = 10.
     try:
         with urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
-    except (HTTPError, URLError, json.JSONDecodeError, TimeoutError) as exc:
+    except HTTPError as exc:
+        status = int(exc.code)
+        if _is_unavailable_status(status):
+            message = "rate-limited or blocked" if status in {403, 429} else "server error"
+            logger.warning("StockTwits blocked for %s (status=%d)", ticker, status)
+            return _unavailable_placeholder(status, message)
+        logger.warning("StockTwits fetch failed for %s: %s", ticker, exc)
+        return f"<stocktwits unavailable: {type(exc).__name__}>"
+    except (URLError, json.JSONDecodeError, TimeoutError) as exc:
         logger.warning("StockTwits fetch failed for %s: %s", ticker, exc)
         return f"<stocktwits unavailable: {type(exc).__name__}>"
 

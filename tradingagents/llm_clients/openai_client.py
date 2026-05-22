@@ -153,6 +153,7 @@ _PROVIDER_BASE_URL = {
     "openrouter": "https://openrouter.ai/api/v1",
     "ollama":     "http://localhost:11434/v1",
 }
+_OLLAMA_PLACEHOLDER_API_KEY = "ollama"
 
 
 def _resolve_provider_base_url(provider: str) -> Optional[str]:
@@ -212,7 +213,7 @@ class OpenAIClient(BaseLLMClient):
                         f"(e.g. add {api_key_env}=your_key to your .env file)."
                     )
             else:
-                llm_kwargs["api_key"] = "ollama"
+                llm_kwargs["api_key"] = _OLLAMA_PLACEHOLDER_API_KEY
         elif self.base_url:
             llm_kwargs["base_url"] = self.base_url
 

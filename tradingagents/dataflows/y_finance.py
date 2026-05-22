@@ -40,10 +40,42 @@ def get_YFin_data_online(
     # Convert DataFrame to CSV string
     csv_string = data.to_csv()
 
-    # Add header information
-    header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date}\n"
-    header += f"# Total records: {len(data)}\n"
-    header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    # Compute authoritative stats so the LLM does NOT have to derive numbers
+    # from CSV rows. Hallucinations in the past (e.g. SOXX 2026-05 run citing
+    # period_min=$122 when real min was $309) came from the model misreading
+    # rows; the prompt enforces "cite only Authoritative stats" downstream.
+    close_series = data["Close"]
+    min_close = float(close_series.min())
+    max_close = float(close_series.max())
+    first_close = float(close_series.iloc[0])
+    last_close = float(close_series.iloc[-1])
+    min_date = close_series.idxmin().strftime("%Y-%m-%d")
+    max_date = close_series.idxmax().strftime("%Y-%m-%d")
+    first_date = close_series.index[0].strftime("%Y-%m-%d")
+    last_date = close_series.index[-1].strftime("%Y-%m-%d")
+    period_return_pct = (last_close - first_close) / first_close * 100.0
+    daily_returns = close_series.pct_change().dropna()
+    volatility_pct = float(daily_returns.std() * 100.0) if len(daily_returns) else 0.0
+    total_volume = int(data["Volume"].sum()) if "Volume" in data.columns else 0
+
+    header = (
+        f"# Stock data for {symbol.upper()} from {start_date} to {end_date}\n"
+        f"# Total records: {len(data)}\n"
+        f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"#\n"
+        f"# AUTHORITATIVE STATS (computed by tool — DO NOT recompute or derive\n"
+        f"# alternative numbers from CSV rows; cite ONLY these values when\n"
+        f"# referencing period prices, ranges, or returns):\n"
+        f"#   period_first_close: {first_close:.2f} ({first_date})\n"
+        f"#   period_last_close: {last_close:.2f} ({last_date})\n"
+        f"#   period_min_close: {min_close:.2f} ({min_date})\n"
+        f"#   period_max_close: {max_close:.2f} ({max_date})\n"
+        f"#   period_return_pct: {period_return_pct:+.2f}\n"
+        f"#   daily_volatility_pct: {volatility_pct:.2f}\n"
+        f"#   trading_days: {len(data)}\n"
+        f"#   total_volume: {total_volume:,}\n"
+        f"#\n"
+    )
 
     return header + csv_string
 
