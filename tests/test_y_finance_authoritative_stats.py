@@ -12,6 +12,8 @@ from unittest.mock import patch
 import pandas as pd
 import pytest
 
+from tradingagents.dataflows.symbol_utils import NoMarketDataError
+
 # Skip in environments where the real yfinance/stockstats stack is not
 # installed; in CI/dev with deps installed these tests will execute and
 # protect against the SOXX hallucination regression.
@@ -60,8 +62,8 @@ def test_authoritative_stats_block_is_present_and_correct():
     assert "period_last_close: 341.54 (2026-03-04)" in out
     assert "period_min_close: 309.79 (2026-03-03)" in out
     assert "period_max_close: 352.05 (2026-03-02)" in out
-    # period_return = (341.54 - 352.05) / 352.05 * 100 ≈ -2.98%
-    assert "period_return_pct: -2.98" in out
+    # period_return = (341.54 - 352.05) / 352.05 * 100 ≈ -2.99%
+    assert "period_return_pct: -2.99" in out
     assert "trading_days: 3" in out
     assert "total_volume: 35,880,000" in out
 
@@ -104,8 +106,8 @@ def test_volatility_is_finite_and_nonzero_for_movement():
     assert vol < 100, "sanity: daily volatility above 100% means a bug"
 
 
-def test_empty_dataframe_returns_no_data_message_unchanged():
-    """Empty-data path must NOT crash trying to compute stats."""
+def test_empty_dataframe_raises_no_market_data_without_stats():
+    """Empty-data path must raise typed no-data before computing stats."""
     get_YFin_data_online = _import_target()
 
     class _EmptyTicker:
@@ -116,8 +118,8 @@ def test_empty_dataframe_returns_no_data_message_unchanged():
 
     with patch("tradingagents.dataflows.y_finance.yf.Ticker", _EmptyTicker), \
          patch("tradingagents.dataflows.y_finance.yf_retry",
-               lambda fn: fn()):
-        out = get_YFin_data_online("XYZ", "2026-03-02", "2026-03-04")
+               lambda fn: fn()), \
+         pytest.raises(NoMarketDataError) as exc:
+        get_YFin_data_online("XYZ", "2026-03-02", "2026-03-04")
 
-    assert out.startswith("No data found for symbol")
-    assert "AUTHORITATIVE STATS" not in out  # no stats on empty
+    assert "no rows between 2026-03-02 and 2026-03-04" in str(exc.value)

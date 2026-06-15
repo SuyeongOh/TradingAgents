@@ -10,7 +10,7 @@ import pandas as pd
 def _install_trading_graph_import_stubs():
     sys.modules.setdefault("yfinance", types.SimpleNamespace(Ticker=None))
 
-    langgraph = sys.modules.setdefault("langgraph", types.ModuleType("langgraph"))
+    sys.modules.setdefault("langgraph", types.ModuleType("langgraph"))
     prebuilt = types.ModuleType("langgraph.prebuilt")
 
     class ToolNode:

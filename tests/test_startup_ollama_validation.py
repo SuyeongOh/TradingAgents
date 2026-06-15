@@ -5,9 +5,7 @@ import urllib.error
 
 import pytest
 
-
 from tests.api_server_test_utils import import_api_server
-
 
 server = import_api_server()
 

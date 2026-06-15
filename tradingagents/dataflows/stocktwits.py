@@ -14,12 +14,13 @@ network call succeeded.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
-from datetime import datetime, timezone
-from typing import Optional
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+from .errors import VendorError, VendorRateLimitError
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,26 @@ def _unavailable_placeholder(status: int, message: str) -> str:
     )
 
 
+class StockTwitsUnavailableError(VendorError):
+    """StockTwits returned a status that means the sentiment signal is missing."""
+
+    def __init__(self, status: int, message: str):
+        self.status = status
+        self.message = message
+        super().__init__(f"StockTwits HTTP {status} {message}")
+
+
+class StockTwitsRateLimitError(StockTwitsUnavailableError, VendorRateLimitError):
+    """StockTwits throttled the request."""
+
+
+def _unavailable_error(status: int) -> StockTwitsUnavailableError:
+    message = "rate-limited or blocked" if status in {403, 429} else "server error"
+    if status == 429:
+        return StockTwitsRateLimitError(status, message)
+    return StockTwitsUnavailableError(status, message)
+
+
 def fetch_stocktwits_messages(ticker: str, limit: int = 30, timeout: float = 10.0) -> str:
     """Fetch recent StockTwits messages for ``ticker`` and return them as a
     formatted plaintext block ready for prompt injection.
@@ -55,12 +76,14 @@ def fetch_stocktwits_messages(ticker: str, limit: int = 30, timeout: float = 10.
     except HTTPError as exc:
         status = int(exc.code)
         if _is_unavailable_status(status):
-            message = "rate-limited or blocked" if status in {403, 429} else "server error"
+            error = _unavailable_error(status)
             logger.warning("StockTwits blocked for %s (status=%d)", ticker, status)
-            return _unavailable_placeholder(status, message)
+            return _unavailable_placeholder(error.status, error.message)
         logger.warning("StockTwits fetch failed for %s: %s", ticker, exc)
         return f"<stocktwits unavailable: {type(exc).__name__}>"
-    except (URLError, json.JSONDecodeError, TimeoutError) as exc:
+    except (OSError, http.client.HTTPException, json.JSONDecodeError) as exc:
+        # OSError covers URLError/TimeoutError/connection resets; HTTPException
+        # covers chunked-transfer errors (IncompleteRead/BadStatusLine, #1024).
         logger.warning("StockTwits fetch failed for %s: %s", ticker, exc)
         return f"<stocktwits unavailable: {type(exc).__name__}>"
 

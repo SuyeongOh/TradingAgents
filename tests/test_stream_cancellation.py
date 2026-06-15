@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import threading
 import time
 
-
 from tests.api_server_test_utils import import_api_server
-
 
 server = import_api_server()
 
@@ -32,10 +31,8 @@ def test_stream_cancel_signals_executor_worker(monkeypatch):
         pending_next = asyncio.create_task(stream.__anext__())
         await asyncio.sleep(0.5)
         pending_next.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await pending_next
-        except asyncio.CancelledError:
-            pass
 
         assert await asyncio.to_thread(worker_done.wait, 1.2)
         assert time.monotonic() - started < 1.5

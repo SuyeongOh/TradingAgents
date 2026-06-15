@@ -7,9 +7,9 @@ import os
 import subprocess
 import time
 import urllib.request
+from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable
 
 logger = logging.getLogger(__name__)
 

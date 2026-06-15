@@ -1,50 +1,53 @@
 # TradingAgents/graph/trading_graph.py
 
+import json
 import logging
 import os
-from pathlib import Path
-import json
+from collections.abc import Callable
 from datetime import datetime, timedelta
-from typing import Callable, Dict, Any, Tuple, List, Optional
+from pathlib import Path
+from typing import Any
 
 import yfinance as yf
-
-logger = logging.getLogger(__name__)
-
 from langgraph.prebuilt import ToolNode
 
-from tradingagents.llm_clients import create_llm_client
-
-from tradingagents.agents import *
-from tradingagents.default_config import DEFAULT_CONFIG
-from tradingagents.agents.utils.memory import TradingMemoryLog
-from tradingagents.dataflows.utils import safe_ticker_component
-from tradingagents.agents.utils.agent_states import (
-    AgentState,
-    InvestDebateState,
-    RiskDebateState,
-)
-from tradingagents.dataflows.config import set_config
-
-# Import the new abstract tool methods from agent_utils
+# Import the abstract tool methods from agent_utils
 from tradingagents.agents.utils.agent_utils import (
-    get_stock_data,
-    get_indicators,
-    get_fundamentals,
+    build_instrument_context,
     get_balance_sheet,
     get_cashflow,
+    get_fundamentals,
+    get_global_news,
     get_income_statement,
-    get_news,
+    get_indicators,
     get_insider_transactions,
-    get_global_news
+    get_macro_indicators,
+    get_news,
+    get_prediction_markets,
+    get_stock_data,
+    get_verified_market_snapshot,
+    resolve_instrument_identity,
+)
+from tradingagents.agents.utils.memory import TradingMemoryLog
+from tradingagents.dataflows.config import set_config
+from tradingagents.dataflows.utils import safe_ticker_component
+from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.llm_clients import create_llm_client
+from tradingagents.llm_clients.ollama_lifecycle import (
+    finish_run_and_stop_when_idle,
+    measure_models_load_seconds,
+    normalize_models,
+    register_run_start,
 )
 
 from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
 from .conditional_logic import ConditionalLogic
-from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
+from .setup import GraphSetup
 from .signal_processing import SignalProcessor
+
+logger = logging.getLogger(__name__)
 
 
 class TradingAgentsGraph:
@@ -52,10 +55,10 @@ class TradingAgentsGraph:
 
     def __init__(
         self,
-        selected_analysts=["market", "social", "news", "fundamentals"],
+        selected_analysts=("market", "social", "news", "fundamentals"),
         debug=False,
-        config: Dict[str, Any] = None,
-        callbacks: Optional[List] = None,
+        config: dict[str, Any] = None,
+        callbacks: list | None = None,
     ):
         """Initialize the trading agents graph and components.
 
@@ -98,7 +101,7 @@ class TradingAgentsGraph:
 
         self.deep_thinking_llm = deep_client.get_llm()
         self.quick_thinking_llm = quick_client.get_llm()
-        
+
         self.memory_log = TradingMemoryLog(self.config)
 
         # Create tool nodes
@@ -131,8 +134,9 @@ class TradingAgentsGraph:
         self.workflow = self.graph_setup.setup_graph(selected_analysts)
         self.graph = self.workflow.compile()
         self._checkpointer_ctx = None
+        self._ollama_run_models: list[str] = []
 
-    def _get_provider_kwargs(self) -> Dict[str, Any]:
+    def _get_provider_kwargs(self) -> dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
         kwargs = {}
         provider = self.config.get("llm_provider", "").lower()
@@ -152,9 +156,16 @@ class TradingAgentsGraph:
             if effort:
                 kwargs["effort"] = effort
 
+        # Sampling temperature is cross-provider: forward it whenever set.
+        # float() here so a value coming from a TRADINGAGENTS_TEMPERATURE env
+        # string ("0.2") works the same as a programmatic float.
+        temperature = self.config.get("temperature")
+        if temperature is not None and temperature != "":
+            kwargs["temperature"] = float(temperature)
+
         return kwargs
 
-    def _create_tool_nodes(self) -> Dict[str, ToolNode]:
+    def _create_tool_nodes(self) -> dict[str, ToolNode]:
         """Create tool nodes for different data sources using abstract methods."""
         return {
             "market": ToolNode(
@@ -163,6 +174,10 @@ class TradingAgentsGraph:
                     get_stock_data,
                     # Technical indicators
                     get_indicators,
+                    # Deterministic verification snapshot (bound to the analyst
+                    # LLM and required by its prompt; must be executable here or
+                    # the call fails and the model reports it "unavailable").
+                    get_verified_market_snapshot,
                 ]
             ),
             "social": ToolNode(
@@ -177,6 +192,8 @@ class TradingAgentsGraph:
                     get_news,
                     get_global_news,
                     get_insider_transactions,
+                    get_macro_indicators,
+                    get_prediction_markets,
                 ]
             ),
             "fundamentals": ToolNode(
@@ -213,14 +230,14 @@ class TradingAgentsGraph:
 
     def _returns_window(
         self, trade_date: str, holding_days: int,
-    ) -> Tuple[datetime, str]:
+    ) -> tuple[datetime, str]:
         start = datetime.strptime(trade_date, "%Y-%m-%d")
         end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
         return start, end.strftime("%Y-%m-%d")
 
     def _returns_from_history(
         self, stock, bench, holding_days: int,
-    ) -> Tuple[Optional[float], Optional[float], Optional[int]]:
+    ) -> tuple[float | None, float | None, int | None]:
         if len(stock) < 2 or len(bench) < 2:
             return None, None, None
 
@@ -239,7 +256,7 @@ class TradingAgentsGraph:
     def _fetch_returns(
         self, ticker: str, trade_date: str, holding_days: int = 5,
         benchmark: str = "SPY",
-    ) -> Tuple[Optional[float], Optional[float], Optional[int]]:
+    ) -> tuple[float | None, float | None, int | None]:
         """Fetch raw and alpha return for ticker over holding_days from trade_date.
 
         ``benchmark`` is the index used as the alpha baseline (resolved by the
@@ -247,10 +264,15 @@ class TradingAgentsGraph:
         actual_holding_days)`` or ``(None, None, None)`` if price data is
         unavailable (too recent, delisted, or network error).
         """
+        from tradingagents.dataflows.symbol_utils import normalize_symbol
+
         try:
             _, end_str = self._returns_window(trade_date, holding_days)
 
-            stock = yf.Ticker(ticker).history(start=trade_date, end=end_str)
+            # Normalize so the realized-return lookup hits the same instrument
+            # the analysis priced (e.g. XAUUSD -> GC=F) (#984). The benchmark is
+            # already a canonical Yahoo symbol from ``_resolve_benchmark``.
+            stock = yf.Ticker(normalize_symbol(ticker)).history(start=trade_date, end=end_str)
             bench = yf.Ticker(benchmark).history(start=trade_date, end=end_str)
             return self._returns_from_history(stock, bench, holding_days)
         except Exception as e:
@@ -274,6 +296,8 @@ class TradingAgentsGraph:
         if not pending:
             return
 
+        from tradingagents.dataflows.symbol_utils import normalize_symbol
+
         benchmark = self._resolve_benchmark(ticker)
         benchmark_history = {}
         updates = []
@@ -281,7 +305,9 @@ class TradingAgentsGraph:
             trade_date = entry["date"]
             try:
                 _, end_str = self._returns_window(trade_date, 5)
-                stock = yf.Ticker(ticker).history(start=trade_date, end=end_str)
+                stock = yf.Ticker(normalize_symbol(ticker)).history(
+                    start=trade_date, end=end_str
+                )
                 cache_key = (benchmark, trade_date, end_str)
                 bench = benchmark_history.get(cache_key)
                 if bench is None:
@@ -291,7 +317,10 @@ class TradingAgentsGraph:
             except Exception as e:
                 logger.warning(
                     "Could not resolve outcome for %s on %s vs %s (will retry next run): %s",
-                    ticker, trade_date, benchmark, e,
+                    ticker,
+                    trade_date,
+                    benchmark,
+                    e,
                 )
                 raw, alpha, days = None, None, None
             if raw is None:
@@ -314,12 +343,24 @@ class TradingAgentsGraph:
         if updates:
             self.memory_log.batch_update_with_outcomes(updates)
 
+    def resolve_instrument_context(self, ticker: str, asset_type: str = "stock") -> str:
+        """Resolve ticker identity once and return the full instrument context.
+
+        Deterministic yfinance lookup (cached, fail-open) injected into a
+        context string so every agent anchors to the real company instead of
+        hallucinating one from the price chart (#814). Both the propagate()
+        path and the CLI call this so the resolved identity reaches the whole
+        graph regardless of entry point.
+        """
+        identity = resolve_instrument_identity(ticker)
+        return build_instrument_context(ticker, asset_type, identity)
+
     def propagate(
         self,
         company_name,
         trade_date,
         asset_type: str = "stock",
-        progress_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Callable[[str], None] | None = None,
     ):
         """Run the trading agents graph for a company on a specific date.
 
@@ -338,6 +379,10 @@ class TradingAgentsGraph:
                 interrupt the run.
         """
         self.ticker = company_name
+        self._ollama_run_models = self._get_ollama_models()
+        if self._ollama_run_models:
+            register_run_start(self._ollama_run_models)
+            measure_models_load_seconds(self._ollama_run_models)
 
         # Resolve any pending memory-log entries for this ticker before the pipeline runs.
         self._resolve_pending_entries(company_name)
@@ -372,19 +417,43 @@ class TradingAgentsGraph:
                 self._checkpointer_ctx.__exit__(None, None, None)
                 self._checkpointer_ctx = None
                 self.graph = self.workflow.compile()
+            self._cleanup_llm_resources()
+
+    def _cleanup_llm_resources(self) -> None:
+        """Release provider resources that otherwise linger after a graph run."""
+        if self._ollama_run_models:
+            finish_run_and_stop_when_idle(self._ollama_run_models)
+            self._ollama_run_models = []
+
+    def _get_ollama_models(self) -> list[str]:
+        """Return Ollama models used by this graph run, or an empty list."""
+        if self.config.get("llm_provider", "").lower() != "ollama":
+            return []
+        return normalize_models(
+            (
+                self.config.get("quick_think_llm"),
+                self.config.get("deep_think_llm"),
+            )
+        )
 
     def _run_graph(
         self,
         company_name,
         trade_date,
         asset_type: str = "stock",
-        progress_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Callable[[str], None] | None = None,
     ):
         """Execute the graph and write the resulting state to disk and memory log."""
-        # Initialize state — inject memory log context for PM.
+        # Initialize state — inject memory log context for PM and the
+        # deterministically resolved instrument identity for all agents.
         past_context = self.memory_log.get_past_context(company_name)
+        instrument_context = self.resolve_instrument_context(company_name, asset_type)
         init_agent_state = self.propagator.create_initial_state(
-            company_name, trade_date, asset_type=asset_type, past_context=past_context
+            company_name,
+            trade_date,
+            asset_type=asset_type,
+            past_context=past_context,
+            instrument_context=instrument_context,
         )
         args = self.propagator.get_graph_args()
 
@@ -412,7 +481,7 @@ class TradingAgentsGraph:
             for chunk in self.graph.stream(init_agent_state, **stream_args):
                 mode, data = chunk
                 if mode == "updates" and isinstance(data, dict):
-                    for node_name in data.keys():
+                    for node_name in data:
                         _notify(node_name)
                 elif mode == "values":
                     final_state = data

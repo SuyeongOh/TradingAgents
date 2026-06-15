@@ -5,7 +5,6 @@ import sys
 import types
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
